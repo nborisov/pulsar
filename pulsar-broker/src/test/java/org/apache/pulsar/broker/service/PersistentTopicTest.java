@@ -1481,8 +1481,8 @@ public class PersistentTopicTest extends MockedBookKeeperTestCase {
         assertFalse((boolean) isClosingOrDeletingField.get(topic));
 
         metadataStore.failConditional(new MetadataStoreException("injected error"), (op, path) ->
-                op == FaultInjectionMetadataStore.OperationType.PUT &&
-                        path.equals("/admin/partitioned-topics/prop/use/ns-abc/persistent/successTopic"));
+                op == FaultInjectionMetadataStore.OperationType.PUT
+                        && path.equals("/admin/partitioned-topics/prop/use/ns-abc/persistent/successTopic"));
         try {
             topic.delete().get();
             fail();

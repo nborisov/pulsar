@@ -22,6 +22,7 @@ import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertNotSame;
 import static org.testng.Assert.assertTrue;
+import com.google.common.collect.ImmutableSet;
 import java.lang.reflect.Field;
 import java.util.HashMap;
 import java.util.Map;
