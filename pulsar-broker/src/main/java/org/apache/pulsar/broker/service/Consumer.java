@@ -333,6 +333,7 @@ public class Consumer {
                         unackedMessages -= (batchSize - BitSet.valueOf(ackSet).cardinality());
                     }
                     pendingAcks.put(entry.getLedgerId(), entry.getEntryId(), batchSize, stickyKeyHash);
+                    subscription.addPendingMessageKey(entry, subscription.getName(), consumerId);
                     if (log.isDebugEnabled()) {
                         log.debug("[{}-{}] Added {}:{} ledger entry with batchSize of {} to pendingAcks in"
                                         + " broker.service.Consumer for consumerId: {}",
@@ -972,6 +973,7 @@ public class Consumer {
      * @param position
      */
     private boolean removePendingAcks(Consumer ackOwnedConsumer, PositionImpl position) {
+        subscription.removePendingMessageKey(position.getEntryId());
         if (!ackOwnedConsumer.getPendingAcks().remove(position.getLedgerId(), position.getEntryId())) {
             // Message was already removed by the other consumer
             return false;
@@ -1092,6 +1094,7 @@ public class Consumer {
     private void clearUnAckedMsgs() {
         int unaAckedMsgs = UNACKED_MESSAGES_UPDATER.getAndSet(this, 0);
         subscription.addUnAckedMessages(-unaAckedMsgs);
+        subscription.cleanPendingMessageKeys();
     }
 
     public boolean isPreciseDispatcherFlowControl() {

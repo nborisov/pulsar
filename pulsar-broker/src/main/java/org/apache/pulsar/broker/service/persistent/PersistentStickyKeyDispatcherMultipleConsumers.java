@@ -41,6 +41,7 @@ import org.apache.bookkeeper.mledger.Position;
 import org.apache.bookkeeper.mledger.impl.ManagedLedgerImpl;
 import org.apache.bookkeeper.mledger.impl.PositionImpl;
 import org.apache.commons.collections4.MapUtils;
+import org.apache.commons.lang3.tuple.Pair;
 import org.apache.pulsar.broker.ServiceConfiguration;
 import org.apache.pulsar.broker.service.BrokerServiceException;
 import org.apache.pulsar.broker.service.ConsistentHashingStickyKeyConsumerSelector;
@@ -56,6 +57,8 @@ import org.apache.pulsar.client.api.Range;
 import org.apache.pulsar.common.api.proto.CommandSubscribe.SubType;
 import org.apache.pulsar.common.api.proto.KeySharedMeta;
 import org.apache.pulsar.common.api.proto.KeySharedMode;
+import org.apache.pulsar.common.api.proto.MessageMetadata;
+import org.apache.pulsar.common.protocol.Commands;
 import org.apache.pulsar.common.util.FutureUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -313,24 +316,36 @@ public class PersistentStickyKeyDispatcherMultipleConsumers extends PersistentDi
             assert consumer != null; // checked when added to groupedEntries
             List<Entry> entriesWithSameKey = current.getValue();
             int entriesWithSameKeyCount = entriesWithSameKey.size();
-            int availablePermits = getAvailablePermits(consumer);
-            int messagesForC = getRestrictedMaxEntriesForConsumer(consumer,
-                    entriesWithSameKey.stream().map(Entry::getPosition).collect(Collectors.toList()), availablePermits,
-                    readType, consumerStickyKeyHashesMap.get(consumer));
+            int availablePermits = Math.max(consumer.getAvailablePermits(), 0);
+            if (consumer.getMaxUnackedMessages() > 0) {
+                int remainUnAckedMessages =
+                        // Avoid negative number
+                        Math.max(consumer.getMaxUnackedMessages() - consumer.getUnackedMessages(), 0);
+                availablePermits = Math.min(availablePermits, remainUnAckedMessages);
+            }
+            int maxMessagesForC = Math.min(entriesWithSameKeyCount, availablePermits);
+            Pair<Integer, List<Entry>> messagesWithEntries = getRestrictedMaxEntriesForConsumerNew(
+                    consumer,
+                    entriesWithSameKey,
+                    maxMessagesForC,
+                    readType, consumerStickyKeyHashesMap.get(consumer)
+            );
+            int messagesForC = messagesWithEntries.getKey();
+            List<Entry> toDispatch = messagesWithEntries.getValue();
             if (log.isDebugEnabled()) {
                 log.debug("[{}] select consumer {} with messages num {}, read type is {}",
                         name, consumer.consumerName(), messagesForC, readType);
             }
 
-            if (messagesForC < entriesWithSameKeyCount) {
+            if (messagesForC < toDispatch.size()) {
                 // We are not able to push all the messages with given key to its consumer,
                 // so we discard for now and mark them for later redelivery
-                for (int i = messagesForC; i < entriesWithSameKeyCount; i++) {
-                    Entry entry = entriesWithSameKey.get(i);
+                for (int i = messagesForC; i < toDispatch.size(); i++) {
+                    Entry entry = toDispatch.get(i);
                     long stickyKeyHash = getStickyKeyHash(entry);
                     addMessageToReplay(entry.getLedgerId(), entry.getEntryId(), stickyKeyHash);
                     entry.release();
-                    entriesWithSameKey.set(i, null);
+                    toDispatch.set(i, null);
                 }
             }
 
@@ -338,7 +353,7 @@ public class PersistentStickyKeyDispatcherMultipleConsumers extends PersistentDi
                 // remove positions first from replay list first : sendMessages recycles entries
                 if (readType == ReadType.Replay) {
                     for (int i = 0; i < messagesForC; i++) {
-                        Entry entry = entriesWithSameKey.get(i);
+                        Entry entry = toDispatch.get(i);
                         redeliveryMessages.remove(entry.getLedgerId(), entry.getEntryId());
                     }
                 }
@@ -346,9 +361,10 @@ public class PersistentStickyKeyDispatcherMultipleConsumers extends PersistentDi
                 SendMessageInfo sendMessageInfo = SendMessageInfo.getThreadLocal();
                 EntryBatchSizes batchSizes = EntryBatchSizes.get(messagesForC);
                 EntryBatchIndexesAcks batchIndexesAcks = EntryBatchIndexesAcks.get(messagesForC);
-                totalEntries += filterEntriesForConsumer(entriesWithSameKey, batchSizes, sendMessageInfo,
+                totalEntries += filterEntriesForConsumer(toDispatch, batchSizes, sendMessageInfo,
                         batchIndexesAcks, cursor, readType == ReadType.Replay, consumer);
-                consumer.sendMessages(entriesWithSameKey, batchSizes, batchIndexesAcks,
+
+                consumer.sendMessages(toDispatch, batchSizes, batchIndexesAcks,
                         sendMessageInfo.getTotalMessages(),
                         sendMessageInfo.getTotalBytes(), sendMessageInfo.getTotalChunkedMessages(),
                         getRedeliveryTracker()).addListener(future -> {
@@ -390,20 +406,22 @@ public class PersistentStickyKeyDispatcherMultipleConsumers extends PersistentDi
         return false;
     }
 
-    private int getRestrictedMaxEntriesForConsumer(Consumer consumer, List<? extends Position> entries,
+    private Pair<Integer, List<Entry>> getRestrictedMaxEntriesForConsumerNew(
+            Consumer consumer,
+            List<Entry> entries,
            int availablePermits, ReadType readType, Set<Integer> stickyKeyHashes) {
         int maxMessages = Math.min(entries.size(), availablePermits);
         if (maxMessages == 0) {
-            return 0;
+            return Pair.of(0, entries);
         }
         if (readType == ReadType.Normal && stickyKeyHashes != null
                 && redeliveryMessages.containsStickyKeyHashes(stickyKeyHashes)) {
             // If redeliveryMessages contains messages that correspond to the same hash as the messages
             // that the dispatcher is trying to send, do not send those messages for order guarantee
-            return 0;
+            return Pair.of(0, entries);
         }
         if (recentlyJoinedConsumers == null) {
-            return maxMessages;
+            return Pair.of(maxMessages, entries);
         }
         removeConsumersFromRecentJoinedConsumers();
         PositionImpl maxReadPosition = recentlyJoinedConsumers.get(consumer);
@@ -411,40 +429,38 @@ public class PersistentStickyKeyDispatcherMultipleConsumers extends PersistentDi
         // is now ready to receive any message
         if (maxReadPosition == null) {
             // The consumer has not recently joined, so we can send all messages
-            return maxMessages;
+            return Pair.of(maxMessages, entries);
         }
 
-        // If the read type is Replay, we should avoid send messages that hold by other consumer to the new consumers,
-        // For example, we have 10 messages [0,1,2,3,4,5,6,7,8,9]
-        // If the consumer0 get message 0 and 1, and does not acked message 0, then consumer1 joined,
-        // when consumer1 get message 2,3, the broker will not dispatch messages to consumer1
-        // because of the mark delete position did not move forward.
-        // So message 2,3 will stored in the redeliver tracker.
-        // Now, consumer2 joined, it will read new messages from the cursor,
-        // so the recentJoinedPosition is 4 for consumer2
-        // Because of there are messages need to redeliver, so the broker will read the redelivery message first [2,3]
-        // message [2,3] is lower than the recentJoinedPosition 4,
-        // so the message [2,3] will dispatched to the consumer2
-        // But the message [2,3] should not dispatch to consumer2.
+        //if pending ack messages tracked we do not need to block recently joined consumers by position
+        return getRestrictedEntriesForConsumerPendingAck(entries, consumer);
+    }
 
-        if (readType == ReadType.Replay) {
-            PositionImpl minReadPositionForRecentJoinedConsumer = recentlyJoinedConsumers.values().iterator().next();
-            if (minReadPositionForRecentJoinedConsumer != null
-                    && minReadPositionForRecentJoinedConsumer.compareTo(maxReadPosition) < 0) {
-                maxReadPosition = minReadPositionForRecentJoinedConsumer;
+    private Pair<Integer, List<Entry>> getRestrictedEntriesForConsumerPendingAck(
+            List<Entry> entries,
+            Consumer consumer
+    ) {
+        List<Entry> filtered = new ArrayList<>(entries.size());
+        //if we have recently joined consumers we should skip sending messages with not acked keys
+        for (Entry entry : entries) {
+            MessageMetadata metadata = Commands.peekAndCopyMessageMetadata(
+                    entry.getDataBuffer(),
+                    subscription.getName(),
+                    consumer.consumerId()
+            );
+
+
+            if (metadata == null || !metadata.hasPartitionKey()
+                    || subscription.couldSendToConsumer(metadata.getPartitionKey(), consumer.consumerId())) {
+                filtered.add(entry);
+            } else {
+                long stickyKeyHash = getStickyKeyHash(entry);
+                addMessageToReplay(entry.getLedgerId(), entry.getEntryId(), stickyKeyHash);
+                entry.release();
             }
         }
-        // Here, the consumer is one that has recently joined, so we can only send messages that were
-        // published before it has joined.
-        for (int i = 0; i < maxMessages; i++) {
-            if (((PositionImpl) entries.get(i)).compareTo(maxReadPosition) >= 0) {
-                // We have already crossed the divider line. All messages in the list are now
-                // newer than what we can currently dispatch to this consumer
-                return i;
-            }
-        }
 
-        return maxMessages;
+        return Pair.of(filtered.size(), filtered);
     }
 
     @Override
@@ -549,6 +565,63 @@ public class PersistentStickyKeyDispatcherMultipleConsumers extends PersistentDi
             }
         }
         return res;
+    }
+
+    private int getRestrictedMaxEntriesForConsumer(Consumer consumer, List<? extends Position> entries,
+                                                   int availablePermits, ReadType readType, Set<Integer> stickyKeyHashes) {
+        int maxMessages = Math.min(entries.size(), availablePermits);
+        if (maxMessages == 0) {
+            return 0;
+        }
+        if (readType == ReadType.Normal && stickyKeyHashes != null
+                && redeliveryMessages.containsStickyKeyHashes(stickyKeyHashes)) {
+            // If redeliveryMessages contains messages that correspond to the same hash as the messages
+            // that the dispatcher is trying to send, do not send those messages for order guarantee
+            return 0;
+        }
+        if (recentlyJoinedConsumers == null) {
+            return maxMessages;
+        }
+        removeConsumersFromRecentJoinedConsumers();
+        PositionImpl maxReadPosition = recentlyJoinedConsumers.get(consumer);
+        // At this point, all the old messages were already consumed and this consumer
+        // is now ready to receive any message
+        if (maxReadPosition == null) {
+            // The consumer has not recently joined, so we can send all messages
+            return maxMessages;
+        }
+
+        // If the read type is Replay, we should avoid send messages that hold by other consumer to the new consumers,
+        // For example, we have 10 messages [0,1,2,3,4,5,6,7,8,9]
+        // If the consumer0 get message 0 and 1, and does not acked message 0, then consumer1 joined,
+        // when consumer1 get message 2,3, the broker will not dispatch messages to consumer1
+        // because of the mark delete position did not move forward.
+        // So message 2,3 will stored in the redeliver tracker.
+        // Now, consumer2 joined, it will read new messages from the cursor,
+        // so the recentJoinedPosition is 4 for consumer2
+        // Because of there are messages need to redeliver, so the broker will read the redelivery message first [2,3]
+        // message [2,3] is lower than the recentJoinedPosition 4,
+        // so the message [2,3] will dispatched to the consumer2
+        // But the message [2,3] should not dispatch to consumer2.
+
+        if (readType == ReadType.Replay) {
+            PositionImpl minReadPositionForRecentJoinedConsumer = recentlyJoinedConsumers.values().iterator().next();
+            if (minReadPositionForRecentJoinedConsumer != null
+                    && minReadPositionForRecentJoinedConsumer.compareTo(maxReadPosition) < 0) {
+                maxReadPosition = minReadPositionForRecentJoinedConsumer;
+            }
+        }
+        // Here, the consumer is one that has recently joined, so we can only send messages that were
+        // published before it has joined.
+        for (int i = 0; i < maxMessages; i++) {
+            if (((PositionImpl) entries.get(i)).compareTo(maxReadPosition) >= 0) {
+                // We have already crossed the divider line. All messages in the list are now
+                // newer than what we can currently dispatch to this consumer
+                return i;
+            }
+        }
+
+        return maxMessages;
     }
 
     /**

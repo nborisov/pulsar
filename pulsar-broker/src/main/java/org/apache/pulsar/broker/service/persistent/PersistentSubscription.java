@@ -31,6 +31,7 @@ import java.util.Optional;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -58,6 +59,7 @@ import org.apache.bookkeeper.mledger.impl.ManagedLedgerImpl;
 import org.apache.bookkeeper.mledger.impl.PositionImpl;
 import org.apache.commons.collections4.MapUtils;
 import org.apache.commons.lang3.tuple.MutablePair;
+import org.apache.commons.lang3.tuple.Pair;
 import org.apache.pulsar.broker.ServiceConfiguration;
 import org.apache.pulsar.broker.intercept.BrokerInterceptor;
 import org.apache.pulsar.broker.loadbalance.extensions.ExtensibleLoadManagerImpl;
@@ -126,6 +128,8 @@ public class PersistentSubscription extends AbstractSubscription implements Subs
     // instance of the map.
     private static final Map<String, Long> REPLICATED_SUBSCRIPTION_CURSOR_PROPERTIES = new TreeMap<>();
     private static final Map<String, Long> NON_REPLICATED_SUBSCRIPTION_CURSOR_PROPERTIES = Collections.emptyMap();
+
+    private final Map<Long, Pair<Long, String>> pendingMessages = new ConcurrentHashMap<>();
 
     private volatile ReplicatedSubscriptionSnapshotCache replicatedSubscriptionSnapshotCache;
     private final PendingAckHandle pendingAckHandle;
@@ -1337,6 +1341,40 @@ public class PersistentSubscription extends AbstractSubscription implements Subs
                 checkAndApplyReachedEndOfTopicOrTopicMigration(topic, dispatcher.getConsumers());
             }
         }
+    }
+
+    @Override
+    public void addPendingMessageKey(Entry pendingMessage, String subscription, long consumerId) {
+        if (pendingMessage != null) {
+            MessageMetadata metadata = Commands.peekAndCopyMessageMetadata(
+                    pendingMessage.getDataBuffer(),
+                    subscription,
+                    consumerId
+            );
+            if (metadata != null && metadata.hasPartitionKey()) {
+                pendingMessages.put(pendingMessage.getEntryId(), Pair.of(consumerId, metadata.getPartitionKey()));
+            }
+        }
+    }
+
+    @Override
+    public void removePendingMessageKey(long pendingEntryId) {
+        pendingMessages.remove(pendingEntryId);
+    }
+
+    @Override
+    public void cleanPendingMessageKeys() {
+        pendingMessages.clear();
+    }
+
+    @Override
+    public boolean couldSendToConsumer(String messageKey, long consumerId) {
+        for (Pair<Long, String> pendingMessageKey: pendingMessages.values()) {
+            if (messageKey.equals(pendingMessageKey.getValue()) && !pendingMessageKey.getKey().equals(consumerId)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     @Override
